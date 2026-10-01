@@ -17,6 +17,8 @@ from spine.cluster.label import (
 from spine.data import ClusterLabelBatch, EdgeIndexBatch, IndexBatch, TensorBatch
 from spine.utils.torch.runtime import cdist_fast
 
+from .time import get_cluster_t0_batch, get_edge_t0
+
 __all__ = ["ClustGeoNodeEncoder", "ClustGeoEdgeEncoder"]
 
 
@@ -47,6 +49,9 @@ class ClustGeoNodeEncoder(torch.nn.Module):
     The flag `add_local_dedxs` adds the local dEdx estimate at each endpoint
     - Start dEdx (1)
     - End dEdx (1)
+
+    The flag `add_t0` adds the charge-light matched time of the cluster
+    - t0 in us (1), has-t0 flag (1), matching confidence (1)
     """
 
     # Name of the node encoder (as specified in the configuration)
@@ -66,6 +71,7 @@ class ClustGeoNodeEncoder(torch.nn.Module):
         dir_max_dist: float | str = 5.0,
         add_local_dedxs: bool = False,
         dedx_max_dist: float = 5.0,
+        add_t0: bool = False,
     ) -> None:
         """Initializes the geometric-based node encoder.
 
@@ -90,6 +96,8 @@ class ClustGeoNodeEncoder(torch.nn.Module):
             Add the local dE/dx estimates at the start and end points
         dedx_max_dist : float, default 5.
             Radius around the end points included to estimate the dE/dx
+        add_t0 : bool, default False
+            Add the charge-light matched t0, its presence flag and confidence
         """
         # Initialize the parent class
         super().__init__()
@@ -103,6 +111,7 @@ class ClustGeoNodeEncoder(torch.nn.Module):
         self.add_local_dirs = add_local_dirs
         self.add_local_dedxs = add_local_dedxs
         self.dedx_max_dist = dedx_max_dist
+        self.add_t0 = add_t0
         self.feature_size = (
             16
             + 2 * int(add_value)
@@ -110,6 +119,7 @@ class ClustGeoNodeEncoder(torch.nn.Module):
             + 6 * int(add_points)
             + 6 * int(add_local_dirs)
             + 2 * int(add_local_dedxs)
+            + 3 * int(add_t0)
         )
 
         # If the maximum distance is specified as `optimize`, optimize it
@@ -137,6 +147,7 @@ class ClustGeoNodeEncoder(torch.nn.Module):
         coord_label: TensorBatch | None = None,
         points: TensorBatch | None = None,
         extra: TensorBatch | None = None,
+        t0: TensorBatch | None = None,
         **kwargs: object,
     ) -> TensorBatch | tuple[TensorBatch, TensorBatch]:
         """Generate geometric cluster node features for one batch of data.
@@ -153,6 +164,8 @@ class ClustGeoNodeEncoder(torch.nn.Module):
             (C, 6) Set of start/end points for each input cluster
         extra : TensorBatch
             (C, 1/2/3) Set of mean/rms values in the cluster and/or shape
+        t0 : TensorBatch, optional
+            (N, 2) Voxel-aligned charge-light matched [t0 (ns), confidence]
         **kwargs : dict, optional
             Additional objects not used by this encoder
 
@@ -244,6 +257,13 @@ class ClustGeoNodeEncoder(torch.nn.Module):
                     data, starts, clusts, self.dedx_max_dist
                 )
                 feats = torch.cat((feats, dedxs.torch_tensor()[:, None]), dim=1)
+
+        # Add the charge-light matched t0
+        if self.add_t0:
+            if t0 is None:
+                raise ValueError("`add_t0` requires the voxel-aligned `t0` input.")
+            clust_t0 = get_cluster_t0_batch(data, t0, clusts)
+            feats = torch.cat((feats, torch.as_tensor(clust_t0).to(feats)), dim=1)
 
         feats = TensorBatch(feats, clusts.counts)
 
@@ -395,6 +415,9 @@ class ClustGeoEdgeEncoder(torch.nn.Module):
     - Displacement vector from the first to the second point defined above (3)
     - Length of the displacement vector (1)
     - Outer product of the displacement vector (9)
+
+    The flag `add_t0` adds the charge-light matched time difference
+    - |t0 difference| in us (1), both-have-t0 flag (1)
     """
 
     # Name of the edge encoder (as specified in the configuration)
@@ -407,6 +430,7 @@ class ClustGeoEdgeEncoder(torch.nn.Module):
         self,
         use_numpy: bool = True,
         use_legacy_distance: bool = False,
+        add_t0: bool = False,
     ) -> None:
         """Initializes the geometric-based node encoder.
 
@@ -417,6 +441,8 @@ class ClustGeoEdgeEncoder(torch.nn.Module):
         use_legacy_distance : bool, default False
             Preserve the historical iterative closest-pair behavior if edge
             features are computed without precomputed closest indexes
+        add_t0 : bool, default False
+            Add the charge-light matched t0 difference between the clusters
         """
         # Initialize the parent class
         super().__init__()
@@ -424,7 +450,8 @@ class ClustGeoEdgeEncoder(torch.nn.Module):
         # Store the parameters
         self.use_numpy = use_numpy
         self.use_legacy_distance = use_legacy_distance
-        self.feature_size = 19
+        self.add_t0 = add_t0
+        self.feature_size = 19 + 2 * int(add_t0)
 
     def forward(
         self,
@@ -432,6 +459,7 @@ class ClustGeoEdgeEncoder(torch.nn.Module):
         clusts: IndexBatch,
         edge_index: EdgeIndexBatch,
         closest_index: np.ndarray | torch.Tensor | None = None,
+        t0: TensorBatch | None = None,
         **kwargs: object,
     ) -> TensorBatch:
         """Generate geometric cluster edge features for one batch of data.
@@ -447,6 +475,8 @@ class ClustGeoEdgeEncoder(torch.nn.Module):
         closest_index : Union[np.ndarray, torch.Tensor], optional
             (C, C) : Combined index of the closest pair of voxels per
             pair of clusters
+        t0 : TensorBatch, optional
+            (N, 2) Voxel-aligned charge-light matched [t0 (ns), confidence]
         **kwargs : dict, optional
             Additional objects not used by this encoder
 
@@ -468,6 +498,14 @@ class ClustGeoEdgeEncoder(torch.nn.Module):
         else:
             # Otherwise, use the local torch method
             feats = self.get_base_features(data, clusts, edge_index, closest_index)
+
+        # Add the |t0 difference| between the two clusters (symmetric, so the
+        # reciprocal edges built below copy it unchanged)
+        if self.add_t0:
+            if t0 is None:
+                raise ValueError("`add_t0` requires the voxel-aligned `t0` input.")
+            edge_t0 = get_edge_t0(get_cluster_t0_batch(data, t0, clusts), edge_index)
+            feats = torch.cat((feats, torch.as_tensor(edge_t0).to(feats)), dim=1)
 
         # If the graph is undirected, infer reciprocal features
         if not edge_index.directed:

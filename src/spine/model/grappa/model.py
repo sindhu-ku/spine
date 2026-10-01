@@ -544,6 +544,7 @@ class GrapPA(torch.nn.Module):
         node_dropout_eligible: TensorBatch | None = None,
         points: TensorBatch | None = None,
         extra: TensorBatch | None = None,
+        t0: TensorBatch | None = None,
     ) -> dict[str, Any]:
         """Build the deterministic graph products consumed by the GNN.
 
@@ -589,6 +590,9 @@ class GrapPA(torch.nn.Module):
             (C, 3/6) Tensor of start (and end) points
         extra : TensorBatch, optional
             (C, N_f) Batch of features to append to the existing node features
+        t0 : TensorBatch, optional
+            (N, 2) Voxel-aligned charge-light matched [t0 (ns), confidence],
+            used by encoders configured with `add_t0`
 
         Returns
         -------
@@ -605,6 +609,10 @@ class GrapPA(torch.nn.Module):
         """
         result: dict[str, Any] = {}
         voxel_data = None
+
+        # Optional voxel-aligned charge-light matched t0, consumed by encoders
+        # configured with `add_t0`
+        t0_kwargs = {} if t0 is None else {"t0": t0}
         if data is not None:
             voxel_data = (
                 data.to_tensor_batch() if isinstance(data, ClusterLabelBatch) else data
@@ -681,7 +689,12 @@ class GrapPA(torch.nn.Module):
                     "Must provide node_features or node encoder configuration to build them."
                 )
             encoded_nodes = self.node_encoder(
-                data, clusts, coord_label=coord_label, points=points, extra=extra
+                data,
+                clusts,
+                coord_label=coord_label,
+                points=points,
+                extra=extra,
+                **t0_kwargs,
             )
 
             if isinstance(encoded_nodes, tuple):
@@ -726,7 +739,11 @@ class GrapPA(torch.nn.Module):
             edge_features = cast(
                 TensorBatch,
                 self.edge_encoder(
-                    voxel_data, clusts, edge_index, closest_index=closest_index
+                    voxel_data,
+                    clusts,
+                    edge_index,
+                    closest_index=closest_index,
+                    **t0_kwargs,
                 ),
             )
 
@@ -934,6 +951,7 @@ class GrapPA(torch.nn.Module):
         node_dropout_eligible: TensorBatch | None = None,
         points: TensorBatch | None = None,
         extra: TensorBatch | None = None,
+        t0: TensorBatch | None = None,
     ) -> dict[str, Any]:
         """Materialize a graph, evaluate the GNN and build predictions.
 
@@ -960,6 +978,7 @@ class GrapPA(torch.nn.Module):
             node_dropout_eligible=node_dropout_eligible,
             points=points,
             extra=extra,
+            t0=t0,
         )
         if self.training:
             graph = self._augment_materialized_graph(graph)

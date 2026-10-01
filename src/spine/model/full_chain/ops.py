@@ -35,6 +35,7 @@ class _PreparedGrapPAInput(_RequiredGrapPAInput, total=False):
     coord_label: TensorBatch
     points: TensorBatch
     extra: TensorBatch
+    t0: TensorBatch
     node_dropout_group_ids: TensorBatch
     node_dropout_eligible: TensorBatch
 
@@ -158,6 +159,19 @@ class AggregationOperations:
             "shapes": shapes,
         }
         encoder = model.node_encoder
+
+        # Charge-light matched t0 travels as extra feature columns of `data`
+        # ([value, t0, t0_cl]); hand it to the t0-aware encoders
+        if getattr(encoder, "add_t0", False) or getattr(
+            model.edge_encoder, "add_t0", False
+        ):
+            cols = data.feature_columns()
+            if len(cols) < 3:
+                raise ValueError(
+                    "GrapPA t0 features require `data` parsed as "
+                    "[value, t0, t0_cl] (sparse_event_list of 3 tensors)."
+                )
+            result["t0"] = TensorBatch(data.torch_tensor()[:, cols[1:3]], data.counts)
 
         # Reconstructed chains must explicitly associate predicted PPN points
         # with their current objects; truth-only runs can use label endpoints.
